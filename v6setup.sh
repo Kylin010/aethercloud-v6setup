@@ -91,14 +91,19 @@ say "  等待 ND 收敛..."
 sleep 10
 
 say "  修复原生地址（厂商脚本会删掉主表原生路由，导致原生地址失联）"
-NAT_ADDR=$(ip -6 addr show scope global | grep -oP 'inet6 \K2401:[0-9a-f:]+' | head -1)
-if [ -n "$NAT_ADDR" ] && ! ip -6 rule show | grep -q "from $NAT_ADDR "; then
-  NAT_GW=$(echo "$NAT_ADDR" | cut -d: -f1-3)::1
+# 原生地址 = 有全局地址但没有专属策略规则的那个（不写死前缀，各机房不同）
+NAT_GW=$(grep -oP 'gateway6:\s*\K[0-9a-f:]+' /etc/netplan/50-cloud-init.yaml 2>/dev/null | head -1)
+[ -z "$NAT_GW" ] && NAT_GW=$(ip -6 route show default 2>/dev/null | grep -v onlink | awk '/^default/{print $3; exit}')
+for A in $(ip -6 addr show scope global | grep -oP 'inet6 \K[0-9a-f:]+'); do
+  case "$A" in fd[0-9a-f]*|fc[0-9a-f]*) continue ;; esac
+  ip -6 rule show | grep -q "from $A " && continue
+  [ -z "$NAT_GW" ] && break
   if ip -6 route replace default via "$NAT_GW" dev "$IFACE" table 16009 onlink 2>/dev/null; then
-    ip -6 rule add from "$NAT_ADDR" table 16009 pref 16009 2>/dev/null
-    say "  ✓ 原生地址已补策略表 16009 (网关 $NAT_GW)"
+    ip -6 rule add from "$A" table 16009 pref 16009 2>/dev/null
+    say "  ✓ 原生地址 $A 已补策略表 16009 (网关 $NAT_GW)"
   fi
-fi
+  break
+done
 sleep 3
 
 hr; say "第 3 步  地址清单"; hr
