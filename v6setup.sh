@@ -13,6 +13,8 @@ ULA=${V6SETUP_ULA:-fd00:6c:7477::1}
 MTU=${V6SETUP_MTU:-1400}
 PROV=/tmp/dv6.sh
 PROV_URL=https://billing.aethercloud.io/dynamicv6/client.sh
+SELF_URL=https://raw.githubusercontent.com/Kylin010/aethercloud-v6setup/main/v6setup.sh
+SELF_PATH=/usr/local/bin/v6setup.sh
 IFACE=$(ip -o route show to default | awk '{print $5; exit}')
 MODE=deploy; PREFIX=""
 
@@ -30,23 +32,78 @@ hr(){ printf '─%.0s' $(seq 60); echo; }
 
 alive(){ [ -n "$(curl -6 -s --interface "$1" --max-time 8 https://api6.ipify.org 2>/dev/null)" ]; }
 
+geo_of(){
+  local j; j=$(curl -4 -s --max-time 6 "http://ip-api.com/json/$1?fields=country,isp" 2>/dev/null)
+  [ -z "$j" ] && { echo ""; return; }
+  if command -v jq >/dev/null 2>&1; then
+    echo "$j" | jq -r 'select(.country!=null) | "\(.country) · \(.isp)"' 2>/dev/null
+  else
+    echo "$j" | sed 's/[{}"]//g;s/country://;s/,isp:/ · /'
+  fi
+}
+
+all_addrs(){ ip -6 addr show scope global | grep -oP 'inet6 \K[0-9a-f:]+' | awk '!seen[$0]++'; }
+
 show_addrs(){
-  for a in $(ip -6 addr show scope global | grep -oP 'inet6 \K[0-9a-f:]+'); do
+  for a in $(all_addrs); do
     ip6=$(curl -6 -s --interface "$a" --max-time 8 https://api6.ipify.org 2>/dev/null)
     if [ -n "$ip6" ]; then
-      geo=$(curl -4 -s --max-time 6 "http://ip-api.com/json/$ip6?fields=country,isp" 2>/dev/null \
-            | sed 's/[{}"]//g;s/country://;s/isp:/ · /')
-      printf '  ✅ %-34s %s\n' "$a" "$geo"
+      printf '  ✅ %-34s %s\n' "$a" "$(geo_of "$ip6")"
     else
       printf '  ❌ %-34s 不通\n' "$a"
     fi
   done
 }
 
+# 历史上出现过 v6nat-tw.service 这类命名，别写死单元名
+nat_units(){ ls /etc/systemd/system/ 2>/dev/null | grep -E '^v6nat(-[a-z0-9]+)?\.service$'; }
+
+# 厂商 timer 只有 OnBootSec + OnUnitActiveSec。开机很久之后如果服务本次开机一次都没跑过，
+# systemd 会算出 NextElapse=infinity 永久停摆，租约不再续。实测撞到过一台 6 天没续约。
+timer_health(){
+  systemctl cat dynamicv6-client.timer >/dev/null 2>&1 || { echo "未安装"; return; }
+  local nx last
+  nx=$(systemctl show dynamicv6-client.timer -p NextElapseUSecMonotonic --value 2>/dev/null)
+  last=$(systemctl show dynamicv6-client.timer -p LastTriggerUSec --value 2>/dev/null)
+  if [ -z "$nx" ] || [ "$nx" = "infinity" ]; then
+    echo "❌ 已停摆，无下次触发（上次 ${last:-未知}）→ systemctl start dynamicv6-client.service"
+  else
+    echo "✅ $(systemctl is-active dynamicv6-client.timer 2>/dev/null)/$(systemctl is-enabled dynamicv6-client.timer 2>/dev/null)（上次 ${last:-未知}）"
+  fi
+}
+
+# 默认出口必须实测。ip -6 route get 在 ECMP 多 nexthop 下只报第一条会骗人，
+# 而 Linux 的 IPv6 ECMP 按 (源,目的) 哈希，得换几个目的地才看得出分流。
+default_exit(){
+  local seen="" r
+  for u in https://api6.ipify.org https://v6.ident.me https://ipv6.icanhazip.com; do
+    r=$(curl -6 -s --max-time 8 "$u" 2>/dev/null | tr -d '\r\n')
+    [ -n "$r" ] && case " $seen " in *" $r "*) : ;; *) seen="$seen $r" ;; esac
+  done
+  seen=${seen# }
+  [ -z "$seen" ] && { echo "❌ 无 IPv6 默认出口"; return; }
+  if [ "$(echo "$seen" | wc -w)" -gt 1 ]; then
+    echo "⚠️  出口不唯一，主表默认路由是 ECMP，按目的地分流:"
+    for x in $seen; do echo "             $x  $(geo_of "$x")"; done
+    echo "             修: /usr/local/bin/dynamicv6-client.sh $IFACE 跑一次，官方脚本会自己收敛成单 nexthop"
+  else
+    echo "$seen  $(geo_of "$seen")"
+  fi
+}
+
+install_self(){
+  if [ -f "$0" ] && [ -r "$0" ]; then cp -f "$0" "$SELF_PATH" 2>/dev/null
+  else curl -fsSL "$SELF_URL" -o "$SELF_PATH" 2>/dev/null; fi
+  [ -s "$SELF_PATH" ] && chmod +x "$SELF_PATH"
+}
+
 # ── 卸载 ──────────────────────────────────────────────
 if [ "$MODE" = uninstall ]; then
-  systemctl disable --now v6nat.service 2>/dev/null
-  rm -f /etc/systemd/system/v6nat.service /usr/local/bin/v6nat.sh /etc/netplan/99-mtu.yaml
+  for u in $(nat_units); do
+    systemctl disable --now "$u" 2>/dev/null
+    rm -f "/etc/systemd/system/$u"
+  done
+  rm -f /usr/local/bin/v6nat.sh /etc/netplan/99-mtu.yaml "$SELF_PATH"
   systemctl daemon-reload 2>/dev/null
   ip6tables -t nat -S POSTROUTING 2>/dev/null | grep -oP -- "-s ${ULA}/128.*--to-source \K[0-9a-f:]+" \
     | while read -r x; do ip6tables -t nat -D POSTROUTING -s "$ULA" -o "$IFACE" -j SNAT --to-source "$x" 2>/dev/null; done
@@ -60,10 +117,18 @@ fi
 # ── 体检 ──────────────────────────────────────────────
 if [ "$MODE" = check ]; then
   hr; say "IPv6 出口体检"; hr
-  say "网卡 $IFACE  MTU $(ip link show "$IFACE" | grep -oP 'mtu \K[0-9]+')"
-  say "厂商 timer   $(systemctl is-active dynamicv6-client.timer 2>/dev/null)/$(systemctl is-enabled dynamicv6-client.timer 2>/dev/null)"
-  say "ULA 服务     $(systemctl is-active v6nat.service 2>/dev/null)/$(systemctl is-enabled v6nat.service 2>/dev/null)"
+  say "网卡         $IFACE  MTU $(ip link show "$IFACE" | grep -oP 'mtu \K[0-9]+')"
+  say "MTU 持久化   $([ -f /etc/netplan/99-mtu.yaml ] && grep -oP 'mtu: \K[0-9]+' /etc/netplan/99-mtu.yaml || echo '❌ 缺失')"
+  say "厂商 timer   $(timer_health)"
+  U=$(nat_units | head -1)
+  if [ -n "$U" ]; then
+    say "ULA 服务     $U  $(systemctl is-active "$U" 2>/dev/null)/$(systemctl is-enabled "$U" 2>/dev/null)"
+  else
+    say "ULA 服务     ❌ 未安装"
+  fi
   say "SNAT 指向    $(ip6tables -t nat -S POSTROUTING 2>/dev/null | grep -oP 'to-source \K[0-9a-f:]+' | head -1 || echo 无)"
+  say "默认 v6 出口 $(default_exit)"
+  say "默认 v4 出口 $(curl -4 -s --max-time 8 https://api4.ipify.org 2>/dev/null || echo 失败)"
   say ""; say "地址状态:"; show_addrs
   exit 0
 fi
@@ -87,24 +152,15 @@ chmod 600 /etc/netplan/99-mtu.yaml
 netplan apply 2>/dev/null
 say "  ✓ 网卡 MTU 固定为 $MTU 并持久化"
 say "    （挂网卡而非路由，厂商 timer 清路由表时碰不到，避免周期性中断）"
+# 主表交给官方脚本，本脚本不碰；它自己会 pin src 并收敛成单 nexthop。
+# 这里只补 timer 的 OnUnitActiveSec 锚点，防止它算出 infinity 永久停摆。
+systemctl enable dynamicv6-client.timer >/dev/null 2>&1
+systemctl start dynamicv6-client.service >/dev/null 2>&1
+say "  ✓ 厂商 timer 锚点已刷新  $(timer_health)"
+install_self && say "  ✓ 本脚本已装到 $SELF_PATH（之后可直接 v6setup.sh --check）"
 say "  等待 ND 收敛..."
 sleep 10
 
-say "  修复原生地址（厂商脚本会删掉主表原生路由，导致原生地址失联）"
-# 原生地址 = 有全局地址但没有专属策略规则的那个（不写死前缀，各机房不同）
-NAT_GW=$(grep -oP 'gateway6:\s*\K[0-9a-f:]+' /etc/netplan/50-cloud-init.yaml 2>/dev/null | head -1)
-[ -z "$NAT_GW" ] && NAT_GW=$(ip -6 route show default 2>/dev/null | grep -v onlink | awk '/^default/{print $3; exit}')
-for A in $(ip -6 addr show scope global | grep -oP 'inet6 \K[0-9a-f:]+'); do
-  case "$A" in fd[0-9a-f]*|fc[0-9a-f]*) continue ;; esac
-  ip -6 rule show | grep -q "from $A " && continue
-  [ -z "$NAT_GW" ] && break
-  if ip -6 route replace default via "$NAT_GW" dev "$IFACE" table 16009 onlink 2>/dev/null; then
-    ip -6 rule add from "$A" table 16009 pref 16009 2>/dev/null
-    say "  ✓ 原生地址 $A 已补策略表 16009 (网关 $NAT_GW)"
-  fi
-  break
-done
-sleep 3
 
 hr; say "第 3 步  地址清单"; hr
 show_addrs
@@ -113,7 +169,8 @@ if [ -z "$PREFIX" ]; then
   hr; say "第 4 步  选择要绑定固定 ULA 的出口"; hr
   say "  绑定后 3x-ui 里只填 $ULA，真实地址变了自动跟随"
   i=1; declare -a CAND
-  for a in $(ip -6 addr show scope global | grep -oP 'inet6 \K[0-9a-f:]+'); do
+  for a in $(all_addrs); do
+    case "$a" in fd[0-9a-f]*|fc[0-9a-f]*) continue ;; esac
     alive "$a" || continue
     CAND[$i]=$a; printf '  %d) %s\n' "$i" "$a"; i=$((i+1))
   done
@@ -130,6 +187,12 @@ TABLE=$(ip -6 rule show | grep "$PREFIX" | grep -oE 'lookup [0-9]{5}' | awk '{pr
 
 hr; say "第 5 步  部署固定 ULA 出口"; hr
 say "  前缀 $PREFIX  策略表 $TABLE  固定地址 $ULA"
+
+for u in $(nat_units | grep -v '^v6nat\.service$'); do
+  systemctl disable --now "$u" 2>/dev/null
+  rm -f "/etc/systemd/system/$u"
+  say "  ✓ 清掉旧单元 $u"
+done
 
 cat > /usr/local/bin/v6nat.sh <<'INNER'
 #!/bin/bash
@@ -177,8 +240,10 @@ systemctl enable --now v6nat.service
 sleep 5
 
 hr; say "完成"; hr
-say "  SNAT 映射   $(ip6tables -t nat -S POSTROUTING | grep -oP 'to-source \K[0-9a-f:]+' | head -1)"
-say "  出口验证   $(curl -6 -s --interface "$ULA" --max-time 12 https://api6.ipify.org 2>/dev/null || echo 失败)"
+say "  SNAT 映射    $(ip6tables -t nat -S POSTROUTING | grep -oP 'to-source \K[0-9a-f:]+' | head -1)"
+say "  ULA 出口     $(curl -6 -s --interface "$ULA" --max-time 12 https://api6.ipify.org 2>/dev/null || echo 失败)"
+say "  默认 v6 出口 $(default_exit)"
 say ""
 say "  3x-ui 出站的「发送通过」填: $ULA"
 say "  这个地址永不改变，真实地址变了服务会自动跟随"
+say "  之后体检: v6setup.sh --check"

@@ -1,6 +1,6 @@
 # aethercloud-v6setup
 
-AetherCloud dynamicv6 住宅 IPv6 一键部署，顺带修掉官方脚本的四个缺陷。
+AetherCloud dynamicv6 住宅 IPv6 一键部署，顺带修掉官方脚本的三个缺陷。
 
 官方脚本能下发地址，但下发完常常不通、或者过几分钟又断。这个脚本在调用官方
 下发之后补上它漏掉的步骤，并把「面板里填一次、地址变了自动跟随」做成常驻服务。
@@ -31,8 +31,11 @@ v6setup.sh --uninstall          # 卸载本脚本装的东西，不动官方的
 本脚本把 MTU 挂到**网卡**上并写进 netplan —— 官方 timer 每 2 分钟清路由表时碰不到它，
 所以不会周期性中断。
 
-**会删掉主表的原生默认路由。**下发后主表指向某个住宅网关，而原生地址没有专属策略规则，
-源地址与网关不匹配被上游反欺骗过滤丢弃，表现为原生 IPv6 失联。本脚本补一条 table 16009。
+**厂商 timer 会永久停摆。**它的 unit 只有 `OnBootSec=2min` + `OnUnitActiveSec=2min`。
+机器开机很久之后，如果 `dynamicv6-client.service` 本次开机一次都没跑过，systemd 会算出
+`NextElapseUSecMonotonic=infinity`，定时器 enabled 也 active，却永远不再触发，租约不再续。
+实测撞到过一台连续 6 天没续约。本脚本部署时用 systemd 跑一次 service 补上锚点，
+`--check` 也会专门报这一项。
 
 **地址会变，而 Xray 的 `sendThrough` 只认具体 IP。**填域名报
 `unable to send through: <域名>`，填 CIDR 段实测 0/3 失败（Xray 从段里随机取地址，
@@ -44,10 +47,15 @@ v6setup.sh --uninstall          # 卸载本脚本装的东西，不动官方的
 ## 装了什么
 
 ```
+/usr/local/bin/v6setup.sh          本脚本自身，装好后可直接 v6setup.sh --check
 /usr/local/bin/v6nat.sh            SNAT 跟随服务
 /etc/systemd/system/v6nat.service  开机自启
 /etc/netplan/99-mtu.yaml           MTU 持久化
 ```
+
+主表默认路由本脚本**不碰**，交给官方脚本——它自己会 pin 源地址并把默认路由收敛成
+单 nexthop。官方早期版本会删掉主表原生默认路由，现在已经修了（`pin_main_default_route_source`），
+所以本脚本里那段 table 16009 的补丁已删除。
 
 固定 ULA 默认 `fd00:6c:7477::1`，用 `V6SETUP_ULA` 环境变量可改。
 MTU 默认 1400，用 `V6SETUP_MTU` 可改。
