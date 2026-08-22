@@ -77,46 +77,27 @@ timer_health(){
 # 默认出口必须实测。ip -6 route get 在 ECMP 多 nexthop 下只报第一条会骗人，
 # 而 Linux 的 IPv6 ECMP 按 (源,目的) 哈希，得换几个目的地才看得出分流。
 default_exit(){
-  local seen="" r
+  local seen="" r nh
+  # 真 ECMP 是路由结构上就有多条 nexthop，直接查，别靠探测推断。
+  # 厂商 timer 每 2 分钟先删后加默认路由，原生那条(metric 1024)最后才回来，
+  # 在这个窗口里主表最优的是住宅备份路由(metric 2048)，探测撞进去就会看到两个出口。
+  nh=$(ip -6 route show default 2>/dev/null | grep -c 'nexthop')
   for u in https://api6.ipify.org https://v6.ident.me https://ipv6.icanhazip.com; do
     r=$(curl -6 -s --max-time 8 "$u" 2>/dev/null | tr -d '\r\n')
     [ -n "$r" ] && case " $seen " in *" $r "*) : ;; *) seen="$seen $r" ;; esac
   done
   seen=${seen# }
   [ -z "$seen" ] && { echo "❌ 无 IPv6 默认出口"; return; }
-  if [ "$(echo "$seen" | wc -w)" -gt 1 ]; then
-    echo "⚠️  出口不唯一，主表默认路由是 ECMP，按目的地分流:"
+  if [ "$nh" -gt 1 ]; then
+    echo "❌ 主表默认路由是 ECMP（$nh 条 nexthop），按目的地分流:"
     for x in $seen; do echo "             $x  $(geo_of "$x")"; done
-    echo "             修: /usr/local/bin/dynamicv6-client.sh $IFACE 跑一次，官方脚本会自己收敛成单 nexthop"
+    echo "             修: /usr/local/bin/dynamicv6-client.sh $IFACE 跑一次，官方脚本会收敛成单 nexthop"
+  elif [ "$(echo "$seen" | wc -w)" -gt 1 ]; then
+    echo "⚠️  探测到多个出口，但主表是单 nexthop —— 多半撞上了厂商 timer 重建路由的瞬间窗口:"
+    for x in $seen; do echo "             $x  $(geo_of "$x")"; done
+    echo "             隔一会再跑一次 --check 确认，持续出现才是真问题"
   else
     echo "$seen  $(geo_of "$seen")"
-  fi
-}
-
-# 给定地址算出能唯一命中它的最短前缀。撞车时多取一段：
-# 同一家 ISP 的两条线（如洛杉矶两条 AT&T 都在 2600:1700）用两段会互相匹配，
-# head -1 就成了掷骰子。台湾这种会换 /80 的，两段仍然唯一，所以不会被加长。
-uniq_prefix(){
-  local a=$1 all n p
-  all=$(ip -6 addr show scope global | grep -oP 'inet6 \K[0-9a-f:]+' | grep -v '^f[cd]')
-  for n in 2 3 4 5; do
-    p=$(echo "$a" | cut -d: -f1-$n)
-    [ "$(echo "$all" | grep -c "^$p")" -eq 1 ] && { echo "$p"; return; }
-  done
-  echo "$a" | cut -d: -f1-2
-}
-
-# ULA 走的表，必须和出口地址自己所属的表是同一个。不一致 = 源地址与隧道不匹配。
-consistency(){
-  local src ula_t src_t
-  src=$(ip6tables -t nat -S POSTROUTING 2>/dev/null | grep -oP 'to-source \K[0-9a-f:]+' | head -1)
-  [ -z "$src" ] && { echo "无 SNAT 规则"; return; }
-  ula_t=$(ip -6 rule show | grep "from ${ULA} " | grep -oE 'lookup [0-9]+' | awk '{print $2}' | head -1)
-  src_t=$(ip -6 rule show | grep "from ${src} " | grep -oE 'lookup [0-9]+' | awk '{print $2}' | head -1)
-  if [ -n "$ula_t" ] && [ "$ula_t" = "$src_t" ]; then
-    echo "✅ ULA 与出口地址同走表 $ula_t"
-  else
-    echo "❌ ULA 走表 ${ula_t:-无}，而出口 $src 属于表 ${src_t:-无}，源地址与隧道不匹配"
   fi
 }
 
