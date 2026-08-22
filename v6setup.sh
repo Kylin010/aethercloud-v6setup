@@ -4,6 +4,7 @@
 #
 # 用法:
 #   v6setup.sh                      下发并部署，交互选择要绑的出口
+#   v6setup.sh --exit <IPv6>        非交互，指定要用哪个出口地址
 #   v6setup.sh --prefix 2001:b011   非交互，直接绑指定前缀
 #   v6setup.sh --check              只体检，不改动
 #   v6setup.sh --uninstall          卸载本脚本装的东西（不动厂商的）
@@ -16,10 +17,11 @@ PROV_URL=https://billing.aethercloud.io/dynamicv6/client.sh
 SELF_URL=https://raw.githubusercontent.com/Kylin010/aethercloud-v6setup/main/v6setup.sh
 SELF_PATH=/usr/local/bin/v6setup.sh
 IFACE=$(ip -o route show to default | awk '{print $5; exit}')
-MODE=deploy; PREFIX=""
+MODE=deploy; PREFIX=""; EXIT_ADDR=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --exit) EXIT_ADDR=$2; shift 2 ;;
     --prefix) PREFIX=$2; shift 2 ;;
     --check) MODE=check; shift ;;
     --uninstall) MODE=uninstall; shift ;;
@@ -91,6 +93,33 @@ default_exit(){
   fi
 }
 
+# 给定地址算出能唯一命中它的最短前缀。撞车时多取一段：
+# 同一家 ISP 的两条线（如洛杉矶两条 AT&T 都在 2600:1700）用两段会互相匹配，
+# head -1 就成了掷骰子。台湾这种会换 /80 的，两段仍然唯一，所以不会被加长。
+uniq_prefix(){
+  local a=$1 all n p
+  all=$(ip -6 addr show scope global | grep -oP 'inet6 \K[0-9a-f:]+' | grep -v '^f[cd]')
+  for n in 2 3 4 5; do
+    p=$(echo "$a" | cut -d: -f1-$n)
+    [ "$(echo "$all" | grep -c "^$p")" -eq 1 ] && { echo "$p"; return; }
+  done
+  echo "$a" | cut -d: -f1-2
+}
+
+# ULA 走的表，必须和出口地址自己所属的表是同一个。不一致 = 源地址与隧道不匹配。
+consistency(){
+  local src ula_t src_t
+  src=$(ip6tables -t nat -S POSTROUTING 2>/dev/null | grep -oP 'to-source \K[0-9a-f:]+' | head -1)
+  [ -z "$src" ] && { echo "无 SNAT 规则"; return; }
+  ula_t=$(ip -6 rule show | grep "from ${ULA} " | grep -oE 'lookup [0-9]+' | awk '{print $2}' | head -1)
+  src_t=$(ip -6 rule show | grep "from ${src} " | grep -oE 'lookup [0-9]+' | awk '{print $2}' | head -1)
+  if [ -n "$ula_t" ] && [ "$ula_t" = "$src_t" ]; then
+    echo "✅ ULA 与出口地址同走表 $ula_t"
+  else
+    echo "❌ ULA 走表 ${ula_t:-无}，而出口 $src 属于表 ${src_t:-无}，源地址与隧道不匹配"
+  fi
+}
+
 install_self(){
   if [ -f "$0" ] && [ -r "$0" ]; then cp -f "$0" "$SELF_PATH" 2>/dev/null
   else curl -fsSL "$SELF_URL" -o "$SELF_PATH" 2>/dev/null; fi
@@ -127,6 +156,7 @@ if [ "$MODE" = check ]; then
     say "ULA 服务     ❌ 未安装"
   fi
   say "SNAT 指向    $(ip6tables -t nat -S POSTROUTING 2>/dev/null | grep -oP 'to-source \K[0-9a-f:]+' | head -1 || echo 无)"
+  say "线路一致性   $(consistency)"
   say "默认 v6 出口 $(default_exit)"
   say "默认 v4 出口 $(curl -4 -s --max-time 8 https://api4.ipify.org 2>/dev/null || echo 失败)"
   say ""; say "地址状态:"; show_addrs
@@ -165,7 +195,13 @@ sleep 10
 hr; say "第 3 步  地址清单"; hr
 show_addrs
 
-if [ -z "$PREFIX" ]; then
+if [ -n "$EXIT_ADDR" ]; then
+  ip -6 addr show scope global | grep -q "\b${EXIT_ADDR}\b" || { say "本机没有地址 $EXIT_ADDR"; exit 1; }
+  PREFIX=$(uniq_prefix "$EXIT_ADDR")
+  hr; say "第 4 步  使用指定出口"; hr
+  say "  出口 $EXIT_ADDR"
+  say "  跟随前缀 $PREFIX"
+elif [ -z "$PREFIX" ]; then
   hr; say "第 4 步  选择要绑定固定 ULA 的出口"; hr
   say "  绑定后 3x-ui 里只填 $ULA，真实地址变了自动跟随"
   i=1; declare -a CAND
@@ -179,14 +215,16 @@ if [ -z "$PREFIX" ]; then
   [ -z "$sel" ] && { say "  已跳过绑定"; exit 0; }
   SEL=${CAND[$sel]:-}
   [ -z "$SEL" ] && { say "  无效选择"; exit 1; }
-  PREFIX=$(echo "$SEL" | cut -d: -f1-2)
+  PREFIX=$(uniq_prefix "$SEL")
 fi
 
-TABLE=$(ip -6 rule show | grep "$PREFIX" | grep -oE 'lookup [0-9]{5}' | awk '{print $2}' | head -1)
-[ -z "$TABLE" ] && { say "找不到前缀 $PREFIX 的策略表"; exit 1; }
+BIND=$(ip -6 addr show scope global | grep -oP "inet6 \K${PREFIX}[0-9a-f:]*" | head -1)
+[ -z "$BIND" ] && { say "前缀 $PREFIX 下没有地址"; exit 1; }
+TABLE=$(ip -6 rule show | grep "from $BIND " | grep -oE 'lookup [0-9]+' | awk '{print $2}' | head -1)
+[ -z "$TABLE" ] && { say "找不到 $BIND 的策略表"; exit 1; }
 
 hr; say "第 5 步  部署固定 ULA 出口"; hr
-say "  前缀 $PREFIX  策略表 $TABLE  固定地址 $ULA"
+say "  出口 $BIND  前缀 $PREFIX  策略表 $TABLE  固定地址 $ULA"
 
 for u in $(nat_units | grep -v '^v6nat\.service$'); do
   systemctl disable --now "$u" 2>/dev/null
@@ -198,14 +236,28 @@ cat > /usr/local/bin/v6nat.sh <<'INNER'
 #!/bin/bash
 # 固定 ULA -> 动态住宅 IPv6 的 SNAT 映射，地址变了自动跟随
 set -u
-FIX=$1; PREFIX=$2; TABLE=$3
+FIX=$1; PREFIX=$2; FALLBACK=${3:-}
 IFACE=$(ip -o route show to default | awk '{print $5; exit}')
 log(){ echo "[v6nat $(date '+%F %T')] $*"; }
 sync_rule(){
   ip -6 addr show dev lo | grep -q "$FIX" || ip -6 addr add "$FIX/128" dev lo 2>/dev/null
-  ip -6 rule show | grep -q "from $FIX " || ip -6 rule add from "$FIX" table "$TABLE" pref 15000 2>/dev/null
+
   cur=$(ip -6 addr show scope global | grep -oP "inet6 \K${PREFIX}[0-9a-f:]*" | head -1)
   [ -z "$cur" ] && { log "前缀 $PREFIX 下无地址，保持原规则"; return; }
+
+  # 表号现查不存。厂商每 2 分钟给每个住宅地址刷一条 from <地址> lookup <表>，那是权威来源。
+  # 部署时写死表号的话，它和 PREFIX 会各自老化，最后漂移成「A 线的源地址走 B 线的隧道」。
+  tbl=$(ip -6 rule show | grep "from $cur " | grep -oE 'lookup [0-9]+' | awk '{print $2}' | head -1)
+  [ -z "$tbl" ] && tbl=$FALLBACK
+  [ -z "$tbl" ] && { log "查不到 $cur 的策略表，保持原规则"; return; }
+
+  now_tbl=$(ip -6 rule show | grep "from $FIX " | grep -oE 'lookup [0-9]+' | awk '{print $2}' | head -1)
+  if [ "$now_tbl" != "$tbl" ]; then
+    [ -n "$now_tbl" ] && ip -6 rule del from "$FIX" table "$now_tbl" 2>/dev/null
+    ip -6 rule add from "$FIX" table "$tbl" pref 15000 2>/dev/null
+    log "策略表更新 ${now_tbl:-无} -> $tbl"
+  fi
+
   now=$(ip6tables -t nat -S POSTROUTING 2>/dev/null | grep -oP -- "-s ${FIX}/128.*--to-source \K[0-9a-f:]+" | head -1)
   [ "$now" = "$cur" ] && return
   [ -n "$now" ] && ip6tables -t nat -D POSTROUTING -s "$FIX" -o "$IFACE" -j SNAT --to-source "$now" 2>/dev/null
@@ -236,12 +288,16 @@ RestartSec=5
 WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
-systemctl enable --now v6nat.service
-sleep 5
+systemctl enable v6nat.service >/dev/null 2>&1
+# 必须 restart 而不是 --now：改出口时单元文件变了但服务还在跑，
+# --now 对已经 active 的单元不做任何事，老进程会带着老参数继续跑。
+systemctl restart v6nat.service
+sleep 6
 
 hr; say "完成"; hr
 say "  SNAT 映射    $(ip6tables -t nat -S POSTROUTING | grep -oP 'to-source \K[0-9a-f:]+' | head -1)"
 say "  ULA 出口     $(curl -6 -s --interface "$ULA" --max-time 12 https://api6.ipify.org 2>/dev/null || echo 失败)"
+say "  线路一致性   $(consistency)"
 say "  默认 v6 出口 $(default_exit)"
 say ""
 say "  3x-ui 出站的「发送通过」填: $ULA"
