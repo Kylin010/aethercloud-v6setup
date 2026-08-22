@@ -101,6 +101,33 @@ default_exit(){
   fi
 }
 
+# 给定地址算出能唯一命中它的最短前缀。撞车时多取一段：
+# 同一家 ISP 的两条线（如洛杉矶两条 AT&T 都在 2600:1700）用两段会互相匹配，
+# head -1 就成了掷骰子。台湾这种会换 /80 的，两段仍然唯一，所以不会被加长。
+uniq_prefix(){
+  local a=$1 all n p
+  all=$(ip -6 addr show scope global | grep -oP 'inet6 \K[0-9a-f:]+' | grep -v '^f[cd]')
+  for n in 2 3 4 5; do
+    p=$(echo "$a" | cut -d: -f1-$n)
+    [ "$(echo "$all" | grep -c "^$p")" -eq 1 ] && { echo "$p"; return; }
+  done
+  echo "$a" | cut -d: -f1-2
+}
+
+# ULA 走的表，必须和出口地址自己所属的表是同一个。不一致 = 源地址与隧道不匹配。
+consistency(){
+  local src ula_t src_t
+  src=$(ip6tables -t nat -S POSTROUTING 2>/dev/null | grep -oP 'to-source \K[0-9a-f:]+' | head -1)
+  [ -z "$src" ] && { echo "无 SNAT 规则"; return; }
+  ula_t=$(ip -6 rule show | grep "from ${ULA} " | grep -oE 'lookup [0-9]+' | awk '{print $2}' | head -1)
+  src_t=$(ip -6 rule show | grep "from ${src} " | grep -oE 'lookup [0-9]+' | awk '{print $2}' | head -1)
+  if [ -n "$ula_t" ] && [ "$ula_t" = "$src_t" ]; then
+    echo "✅ ULA 与出口地址同走表 $ula_t"
+  else
+    echo "❌ ULA 走表 ${ula_t:-无}，而出口 $src 属于表 ${src_t:-无}，源地址与隧道不匹配"
+  fi
+}
+
 install_self(){
   if [ -f "$0" ] && [ -r "$0" ]; then cp -f "$0" "$SELF_PATH" 2>/dev/null
   else curl -fsSL "$SELF_URL" -o "$SELF_PATH" 2>/dev/null; fi
