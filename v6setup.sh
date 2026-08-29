@@ -4,6 +4,7 @@
 #
 # 用法:
 #   v6setup.sh                      下发并部署，交互选择要绑的出口
+#   v6setup.sh --auto               非交互，自动选第一个可用的住宅出口
 #   v6setup.sh --exit <IPv6>        非交互，指定要用哪个出口地址
 #   v6setup.sh --prefix 2001:b011   非交互，直接绑指定前缀
 #   v6setup.sh --check              只体检，不改动
@@ -17,10 +18,11 @@ PROV_URL=https://billing.aethercloud.io/dynamicv6/client.sh
 SELF_URL=https://raw.githubusercontent.com/Kylin010/aethercloud-v6setup/main/v6setup.sh
 SELF_PATH=/usr/local/bin/v6setup.sh
 IFACE=$(ip -o route show to default | awk '{print $5; exit}')
-MODE=deploy; PREFIX=""; EXIT_ADDR=""
+MODE=deploy; PREFIX=""; EXIT_ADDR=""; AUTO=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --auto) AUTO=1; shift ;;
     --exit) EXIT_ADDR=$2; shift 2 ;;
     --prefix) PREFIX=$2; shift 2 ;;
     --check) MODE=check; shift ;;
@@ -128,6 +130,15 @@ consistency(){
   fi
 }
 
+# 住宅出口 = 厂商给租约地址建了专属策略规则的那些。原生地址没有规则，ULA 是我们自己加的。
+residential_addrs(){
+  for a in $(all_addrs); do
+    case "$a" in fd[0-9a-f]*|fc[0-9a-f]*) continue ;; esac
+    ip -6 rule show | grep -qE "from $a +lookup [0-9]+" || continue
+    echo "$a"
+  done
+}
+
 install_self(){
   if [ -f "$0" ] && [ -r "$0" ]; then cp -f "$0" "$SELF_PATH" 2>/dev/null
   else curl -fsSL "$SELF_URL" -o "$SELF_PATH" 2>/dev/null; fi
@@ -203,11 +214,19 @@ sleep 10
 hr; say "第 3 步  地址清单"; hr
 show_addrs
 
+AUTOPICK=""
+if [ "$AUTO" = 1 ] && [ -z "$EXIT_ADDR" ] && [ -z "$PREFIX" ]; then
+  for a in $(residential_addrs); do
+    alive "$a" && { EXIT_ADDR=$a; AUTOPICK="（自动选中）"; break; }
+  done
+  [ -z "$EXIT_ADDR" ] && { hr; say "第 4 步  自动选择出口"; hr; say "  没有可用的住宅出口，中止"; exit 1; }
+fi
+
 if [ -n "$EXIT_ADDR" ]; then
   ip -6 addr show scope global | grep -q "\b${EXIT_ADDR}\b" || { say "本机没有地址 $EXIT_ADDR"; exit 1; }
   PREFIX=$(uniq_prefix "$EXIT_ADDR")
-  hr; say "第 4 步  使用指定出口"; hr
-  say "  出口 $EXIT_ADDR"
+  hr; say "第 4 步  确定出口${AUTOPICK}"; hr
+  say "  出口 $EXIT_ADDR  $(geo_of "$EXIT_ADDR")"
   say "  跟随前缀 $PREFIX"
 elif [ -z "$PREFIX" ]; then
   hr; say "第 4 步  选择要绑定固定 ULA 的出口"; hr
