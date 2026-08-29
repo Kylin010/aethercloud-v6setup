@@ -139,6 +139,19 @@ residential_addrs(){
   done
 }
 
+# 在住宅出口里挑延迟最低的。原来取第一个，顺序由厂商分配租约的次序决定，
+# 同一批机器可能一半绑加州一半绑芝加哥（实测两者 ping 差 10 倍）。
+pick_best(){
+  local a t best="" bt=""
+  for a in $(residential_addrs); do
+    t=$(curl -6 -s -o /dev/null --interface "$a" --max-time 8 -w '%{time_connect}' https://api6.ipify.org 2>/dev/null)
+    case "$t" in ''|0.000000|0) continue ;; esac
+    if [ -z "$bt" ] || awk -v x="$t" -v y="$bt" 'BEGIN{exit !(x<y)}'; then bt=$t; best=$a; fi
+  done
+  [ -n "$best" ] && { echo "$best"; return 0; }
+  return 1
+}
+
 install_self(){
   if [ -f "$0" ] && [ -r "$0" ]; then cp -f "$0" "$SELF_PATH" 2>/dev/null
   else curl -fsSL "$SELF_URL" -o "$SELF_PATH" 2>/dev/null; fi
@@ -216,10 +229,20 @@ show_addrs
 
 AUTOPICK=""
 if [ "$AUTO" = 1 ] && [ -z "$EXIT_ADDR" ] && [ -z "$PREFIX" ]; then
-  for a in $(residential_addrs); do
-    alive "$a" && { EXIT_ADDR=$a; AUTOPICK="（自动选中）"; break; }
+  hr; say "第 4 步  自动选择出口"; hr
+  # 首次分配的租约，宿主机侧 WireGuard 隧道要几分钟才建好。此时地址已配到网卡、
+  # 策略规则和网关邻居状态全对，但三层转发不通——实测等 4 分钟后自愈。所以要重试。
+  tries=0
+  while :; do
+    EXIT_ADDR=$(pick_best) && break
+    tries=$((tries+1))
+    [ "$tries" -ge "${V6SETUP_RETRY:-10}" ] && break
+    say "  住宅出口尚未连通，30 秒后重试（$tries/${V6SETUP_RETRY:-10}）"
+    say "    新分配的租约需要等宿主机建隧道，通常 2~5 分钟"
+    sleep 30
   done
-  [ -z "$EXIT_ADDR" ] && { hr; say "第 4 步  自动选择出口"; hr; say "  没有可用的住宅出口，中止"; exit 1; }
+  [ -z "$EXIT_ADDR" ] && { say "  等待超时，仍无可用住宅出口"; say "  地址通了之后重跑本命令即可，无需清理"; exit 1; }
+  AUTOPICK="（自动选中，延迟最低）"
 fi
 
 if [ -n "$EXIT_ADDR" ]; then
