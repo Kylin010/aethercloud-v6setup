@@ -14,7 +14,7 @@ set -u
 ULA=${V6SETUP_ULA:-fd00:6c:7477::1}
 MTU=${V6SETUP_MTU:-1400}
 PROV=/tmp/dv6.sh
-PROV_URL=https://billing.aethercloud.io/dynamicv6/client.sh
+PROV_URL=https://aethercloud.io/dynamicv6/client.sh
 SELF_URL=https://raw.githubusercontent.com/Kylin010/aethercloud-v6setup/main/v6setup.sh
 SELF_PATH=/usr/local/bin/v6setup.sh
 IFACE=$(ip -o route show to default | awk '{print $5; exit}')
